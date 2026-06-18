@@ -2,25 +2,25 @@
 # ESPHome firmware for Olimex ESP32-C3-DevKit-Lipo
 # Hardware: Waveshare HMMD S3KM1110 24GHz radar + DFRobot DFR0032 passive buzzer
 #
-# Wiring summary:
+# Wiring:
 #   GPIO4  → buzzer signal (LEDC PWM)
 #   GPIO5  → radar OT2 presence output (digital input, pulldown)
-#   GPIO3  → optional radar RX line (ESP TX → radar RX)  \  only needed if
-#   GPIO6  → optional radar TX line (radar TX → ESP RX)  /  sending UART config at boot
+#   GPIO7  → radar TX (radar → ESP, monitoring data — ASCII or binary frames)
+#   GPIO3  → radar RX (ESP → radar, optional — only needed to send the Report
+#                       Mode command for binary frames with energy data)
 
 # -----------------------------------------------------------------------
 # TUNABLE SUBSTITUTIONS — edit these before flashing, no code changes needed
 # -----------------------------------------------------------------------
 substitutions:
-  # Alarm window: weekdays only
-  alarm_start_hour:   "8"
-  alarm_start_minute: "30"
-  alarm_end_hour:     "9"
-  alarm_end_minute:   "30"
+  # Default alarm window (HH:MM:SS, 24h). Stored in the datetime entities at runtime,
+  # restored across reboots. Edit these for the boot default; the UI overrides them.
+  alarm_window_start: "08:30:00"
+  alarm_window_end:   "09:30:00"
 
-  # Normal alarm: loud, continuous (duty is now a runtime slider; this is the boot default)
-  alarm_freq_hz:       "2500"   # Hz — 2–3 kHz is most piercing for piezo buzzers
-  alarm_duty_default:  "80"     # percentage, 0–100; stored in number entity at runtime
+  # Normal alarm: loud, continuous. Duty is a runtime slider; this is the boot default.
+  alarm_freq_hz:       "2500"   # 2–3 kHz is most piercing for piezo buzzers
+  alarm_duty_default:  "80"     # percentage, 0–100
 
   # Debug/calibration: gentle intermittent pip
   debug_freq_hz:  "1000"   # lower pitch, less aggressive
@@ -37,7 +37,7 @@ esphome:
     # so configure_radar reads the correct slider values, not just initial_value defaults.
     priority: -100
     then:
-      - delay: 1500ms   # give S3KM1110's PY32F003 MCU time to finish its own startup
+      - delay: 3000ms
       - script.execute: configure_radar
 
 esp32:
@@ -50,10 +50,10 @@ esp32:
     type: arduino
 
 # -----------------------------------------------------------------------
-# LOGGING — reduce to INFO once you've confirmed everything works
+# LOGGING
 # -----------------------------------------------------------------------
 logger:
-  level: DEBUG
+  level: INFO
 
 # -----------------------------------------------------------------------
 # WI-FI + FALLBACK AP
@@ -115,13 +115,14 @@ time:
           - script.execute: evaluate_buzzer
 
 # -----------------------------------------------------------------------
-# UART — radar configuration at boot (IO3=ESP TX→radar RX, IO6=radar TX→ESP RX)
-# Only used for the on_boot config sequence; OT2 is still the runtime presence signal.
+# UART — radar monitoring (GPIO7 = radar TX → ESP RX, mandatory for monitoring)
+#                          (GPIO3 = ESP TX → radar RX, only if sending Report Mode)
+# OT2 (GPIO5) drives the alarm; UART data is for the web-UI sensors only.
 # -----------------------------------------------------------------------
 uart:
   - id: radar_uart
     tx_pin: GPIO3
-    rx_pin: GPIO6
+    rx_pin: GPIO7
     baud_rate: 115200
 
 # -----------------------------------------------------------------------
@@ -136,10 +137,9 @@ output:
     id: buzzer_out
 
 # -----------------------------------------------------------------------
-# BINARY SENSOR — radar OT2 presence pin on GPIO5
+# BINARY SENSOR — radar OT2 presence pin on GPIO5. THIS is what triggers the alarm.
 # OT2 goes HIGH while a person is detected, LOW when the zone is clear.
-# delayed_off: 500ms debounces momentary radar dropouts without delaying
-# the genuine "person left" event beyond the 1–2 s requirement.
+# delayed_off absorbs brief radar dropouts without delaying "person left" much.
 # -----------------------------------------------------------------------
 binary_sensor:
   - platform: gpio
@@ -152,12 +152,12 @@ binary_sensor:
     name: "Radar Presence"
     device_class: occupancy
     filters:
-      - delayed_off: 2s   # absorbs OT2 dropouts during UART config sequence and radar jitter
+      - delayed_off: 500ms
     on_press:
       - logger.log: "Radar: PRESENT"
       - script.execute: evaluate_buzzer
     on_release:
-      # This is the core safety guarantee: presence loss → immediate silence.
+      # Core safety guarantee: presence loss → immediate silence.
       - logger.log: "Radar: ABSENT — silencing"
       - script.execute: silence
 
@@ -177,8 +177,9 @@ number:
     restore_value: true
     unit_of_measurement: "%"
 
-  # Max detection gate: each gate ≈ 0.70m from sensor. Gate 2 = ~1.4m, gate 3 = ~2.1m.
-  # Changing this re-sends UART config immediately.
+  # Max detection gate (each gate ≈ 0.70m). Configures the radar's hardware
+  # max-range via SetConfig param 0x01. Targets beyond this gate won't trigger
+  # OT2 — i.e. won't sound the alarm. Press "Apply Radar Config" after changing.
   - platform: template
     name: "Radar Max Gate"
     id: radar_max_gate
@@ -191,72 +192,66 @@ number:
     restore_value: true
     unit_of_measurement: "gates"
 
-  # How long after a person leaves before OT2 goes LOW.
-  # 1s = sharpest cutoff; increase if you get false absences mid-sleep.
+  # Seconds after a target leaves before the radar reports absence on OT2.
+  # Configures the radar via SetConfig param 0x04. Low = fast alarm cutoff.
   - platform: template
     name: "Radar Disappearance Delay"
     id: radar_disappearance_delay
     icon: "mdi:timer-off"
-    min_value: 1
-    max_value: 10
+    min_value: 0
+    max_value: 30
     step: 1
-    initial_value: 1
+    initial_value: 5
     optimistic: true
     restore_value: true
     unit_of_measurement: "s"
 
 
 # -----------------------------------------------------------------------
-# SELECT — time window dropdowns (stored in flash, survive reboots)
-# evaluate_buzzer reads these as strings and converts to int.
+# DATETIME — alarm window times (native HH:MM picker in the web UI)
+# Stored in flash; survive reboots. evaluate_buzzer reads .hour and .minute.
 # -----------------------------------------------------------------------
-select:
+datetime:
   - platform: template
-    name: "Window Start Hour"
-    id: window_start_hour
+    name: "Window Start"
+    id: window_start
+    type: time
     icon: "mdi:clock-start"
     optimistic: true
     restore_value: true
-    initial_option: "${alarm_start_hour}"
-    options: ["4","5","6","7","8","9","10","11","12"]
+    initial_value: "${alarm_window_start}"
 
   - platform: template
-    name: "Window Start Minute"
-    id: window_start_minute
-    icon: "mdi:clock-start"
-    optimistic: true
-    restore_value: true
-    initial_option: "${alarm_start_minute}"
-    options: ["0","5","10","15","20","25","30","35","40","45","50","55"]
-
-  - platform: template
-    name: "Window End Hour"
-    id: window_end_hour
+    name: "Window End"
+    id: window_end
+    type: time
     icon: "mdi:clock-end"
     optimistic: true
     restore_value: true
-    initial_option: "${alarm_end_hour}"
-    options: ["4","5","6","7","8","9","10","11","12"]
-
-  - platform: template
-    name: "Window End Minute"
-    id: window_end_minute
-    icon: "mdi:clock-end"
-    optimistic: true
-    restore_value: true
-    initial_option: "${alarm_end_minute}"
-    options: ["0","5","10","15","20","25","30","35","40","45","50","55"]
+    initial_value: "${alarm_window_end}"
 
 # -----------------------------------------------------------------------
-# BUTTON — test the buzzer at current alarm volume for 3 seconds
+# BUTTONS — manual triggers from the web UI
 # -----------------------------------------------------------------------
 button:
+  # Pushes Max Gate + Disappearance Delay slider values to the radar over UART
+  # and re-asserts Report Mode. Requires Radar RX wired to GPIO3.
   - platform: template
     name: "Apply Radar Config"
     icon: "mdi:radar"
     on_press:
       - script.execute: configure_radar
 
+  # Triggers the radar's AutoThresholdGen (cmd 0x09). LEAVE THE ROOM FIRST —
+  # the radar samples background noise for ~10s with no people in view, then
+  # auto-tunes its internal thresholds.
+  - platform: template
+    name: "Auto-Calibrate Radar"
+    icon: "mdi:tune-vertical"
+    on_press:
+      - script.execute: auto_calibrate_radar
+
+  # Sounds the alarm tone at the current Alarm Volume for 3 seconds.
   - platform: template
     name: "Test Buzzer"
     icon: "mdi:bullhorn"
@@ -294,109 +289,184 @@ switch:
       - script.execute: evaluate_buzzer   # re-evaluate: silence if outside window
 
 # -----------------------------------------------------------------------
-# INTERVAL — parse S3KM1110 UART data frames to get distance + presence
-# Data frame: F4 F3 F2 F1 | 2-byte len LE | 1-byte detected | 2-byte dist LE
-#             | 32-byte gate energy | F8 F7 F6 F5  (45 bytes total)
-# Command ACK frames start with 0xFD and are silently ignored here.
+# INTERVAL — parse the radar's UART stream into web-UI sensors.
+# The S3KM1110 defaults to Normal Mode and outputs ASCII like "ON\r\nRange 4\r\n"
+# (gate number, each gate ≈ 70cm). If we successfully send the Report Mode
+# command (requires ESP TX → radar RX wire), it switches to binary frames:
+#   F4 F3 F2 F1 | len LE (2) | detected (1) | dist LE (2) | 16-gate energies
+#   (32) | F8 F7 F6 F5  — 45 bytes total. Parser auto-detects which is arriving.
 # -----------------------------------------------------------------------
 interval:
   - interval: 50ms
     then:
       - lambda: |-
-          static uint8_t buf[45];
+          // Parser handles both radar output formats:
+          //   Binary Report Mode: F4 F3 F2 F1 ... F8 F7 F6 F5
+          //   ASCII Normal Mode : "ON\r\nRange N\r\n" / "OFF\r\nRange N\r\n"
+          // Command ACK frames (FD FC FB FA ...) are silently consumed.
+          static uint8_t buf[64];
           static uint8_t pos = 0;
-          static bool in_frame = false;
+          static uint8_t frame_type = 0;   // 0=idle, 1=F4 data, 2=FD ack, 3=ASCII
+          static bool ascii_detected = false;
 
           while (id(radar_uart).available()) {
             uint8_t b = 0;
             if (!id(radar_uart).read_byte(&b)) break;
 
-            if (!in_frame) {
-              // Accumulate the 4-byte data-frame header F4 F3 F2 F1
-              if      (pos == 0 && b == 0xF4) buf[pos++] = b;
-              else if (pos == 1 && b == 0xF3) buf[pos++] = b;
-              else if (pos == 2 && b == 0xF2) buf[pos++] = b;
-              else if (pos == 3 && b == 0xF1) { buf[pos++] = b; in_frame = true; }
-              else    pos = (b == 0xF4) ? 1 : 0;   // restart if header breaks
-            } else {
-              if (pos < 45) {
-                buf[pos++] = b;
-                if (pos >= 8) {
-                  uint16_t data_len   = buf[4] | (buf[5] << 8);
-                  uint16_t frame_size = 4 + 2 + data_len + 4;
-                  if (pos == frame_size) {
-                    // Validate footer
-                    if (buf[pos-4]==0xF8 && buf[pos-3]==0xF7 && buf[pos-2]==0xF6 && buf[pos-1]==0xF5) {
-                      bool detected  = (buf[6] == 0x01);
-                      uint16_t dist  = buf[7] | (buf[8] << 8);
-                      id(radar_distance).publish_state(detected ? (float)dist : 0.0f);
+            if (frame_type == 0) {
+              if      (b == 0xF4) { buf[0] = b; pos = 1; frame_type = 1; }
+              else if (b == 0xFD) { buf[0] = b; pos = 1; frame_type = 2; }
+              else if (b >= 0x20 && b < 0x7F) { buf[0] = b; pos = 1; frame_type = 3; }
+              continue;
+            }
+
+            if (frame_type == 1) {                 // Binary Report Mode
+              if (pos == 1 && b != 0xF3) { frame_type = 0; pos = 0; continue; }
+              if (pos == 2 && b != 0xF2) { frame_type = 0; pos = 0; continue; }
+              if (pos == 3 && b != 0xF1) { frame_type = 0; pos = 0; continue; }
+              if (pos < sizeof(buf)) buf[pos++] = b;
+              else { frame_type = 0; pos = 0; continue; }
+              if (pos >= 8) {
+                uint16_t data_len   = buf[4] | (buf[5] << 8);
+                uint16_t frame_size = 4 + 2 + data_len + 4;
+                if (frame_size > sizeof(buf)) { frame_type = 0; pos = 0; continue; }
+                if (pos == frame_size) {
+                  if (buf[pos-4]==0xF8 && buf[pos-3]==0xF7 && buf[pos-2]==0xF6 && buf[pos-1]==0xF5) {
+                    bool     detected = (buf[6] == 0x01);
+                    uint16_t dist     = buf[7] | (buf[8] << 8);
+                    uint8_t  max_gate = (uint8_t)id(radar_max_gate).state;
+                    uint16_t peak     = 0;
+                    for (uint8_t g = 0; g <= max_gate && g < 16; g++) {
+                      uint16_t e = buf[9 + g*2] | (buf[10 + g*2] << 8);
+                      if (e > peak) peak = e;
                     }
-                    pos = 0; in_frame = false;
+                    id(radar_distance).publish_state(detected ? (float)dist : 0.0f);
+                    id(radar_peak_energy).publish_state((float)peak);
+                    id(radar_target_type).publish_state(detected ? "present" : "absent");
                   }
+                  frame_type = 0; pos = 0;
                 }
-              } else {
-                pos = 0; in_frame = false;   // overrun, discard
               }
+              continue;
+            }
+
+            if (frame_type == 2) {                 // Command ACK — consume and discard
+              if (pos == 1 && b != 0xFC) { frame_type = 0; pos = 0; continue; }
+              if (pos == 2 && b != 0xFB) { frame_type = 0; pos = 0; continue; }
+              if (pos == 3 && b != 0xFA) { frame_type = 0; pos = 0; continue; }
+              if (pos < sizeof(buf)) buf[pos++] = b;
+              else { frame_type = 0; pos = 0; continue; }
+              if (pos >= 8) {
+                uint16_t data_len   = buf[4] | (buf[5] << 8);
+                uint16_t frame_size = 4 + 2 + data_len + 4;
+                if (frame_size > sizeof(buf)) { frame_type = 0; pos = 0; continue; }
+                if (pos == frame_size) { frame_type = 0; pos = 0; }
+              }
+              continue;
+            }
+
+            // frame_type == 3 (ASCII Normal Mode)
+            if (b == 0xF4) { buf[0] = b; pos = 1; frame_type = 1; continue; }
+            if (b == 0xFD) { buf[0] = b; pos = 1; frame_type = 2; continue; }
+            if (pos < sizeof(buf) - 1) buf[pos++] = b;
+            if (b == '\n') {
+              buf[pos] = '\0';
+              const char* s = (const char*)buf;
+              if (strstr(s, "OFF")) {
+                ascii_detected = false;
+                id(radar_target_type).publish_state("absent");
+                id(radar_distance).publish_state(0.0f);
+              } else if (strstr(s, "ON")) {
+                ascii_detected = true;
+                id(radar_target_type).publish_state("present");
+              } else {
+                const char* rng = strstr(s, "Range ");
+                if (rng) {
+                  int gate = atoi(rng + 6);
+                  id(radar_distance).publish_state(ascii_detected ? (float)(gate * 70) : 0.0f);
+                }
+              }
+              frame_type = 0; pos = 0;
             }
           }
 
 # -----------------------------------------------------------------------
 # SCRIPTS
-# Four scripts:
-#   configure_radar — sends UART config using current slider values
-#   evaluate_buzzer — the single decision point; everything calls this
-#   alarm_on        — activates the output (differently for debug vs normal)
-#   silence         — deactivates the output and kills alarm_on if running
+#   configure_radar      — pushes Max Gate + Disappearance Delay + Report Mode
+#   auto_calibrate_radar — radar self-calibration (cmd 0x09); leave the room first
+#   evaluate_buzzer      — single decision point; everything calls this
+#   alarm_on             — activates the buzzer (different patterns for debug vs normal)
+#   silence              — deactivates the buzzer and kills alarm_on
 # -----------------------------------------------------------------------
 script:
-  # configure_radar: sends OpenMode → SetConfig (max gate + disappearance delay) → CloseMode
-  # → Report mode using the current slider values. Called at boot and whenever sliders change.
-  # mode: single drops re-entrant calls; the config takes ~2s so don't stack them.
+  # Protocol per https://github.com/2Grey/s3km1110 (S3KM1110 == LD2410-compatible):
+  #   1. OpenCommandMode (0xFF, payload 0x0001) — required before SetConfig
+  #   2. SetConfig MaxDistance      (0x07, param 0x01) — value = radar_max_gate
+  #   3. SetConfig DisappearanceDelay (0x07, param 0x04) — value = radar_disappearance_delay (seconds, u16 LE)
+  #   4. CloseCommandMode (0xFE)
+  #   5. SetMode Report (0x12, value 0x00000004) — switch UART output to binary frames
+  # Only documented ConfigParam IDs (0x00, 0x01, 0x04, 0x05) are safe; sending
+  # undefined IDs has been shown to crash the radar MCU until power-cycled.
   - id: configure_radar
     mode: single
     then:
-      # Open command mode: cmd=0xFF payload=0x0001
       - uart.write:
           id: radar_uart
           data: [0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01]
-      - delay: 300ms
-      # SetConfig MaxDistance — read gate value from slider
+      - delay: 100ms
       - lambda: |-
           uint8_t gate = (uint8_t)id(radar_max_gate).state;
           uint8_t cmd[] = {0xFD,0xFC,0xFB,0xFA, 0x08,0x00, 0x07,0x00,
                            0x01,0x00, gate,0x00,0x00,0x00, 0x04,0x03,0x02,0x01};
           id(radar_uart).write_array(cmd, sizeof(cmd));
-      - delay: 300ms
-      # Close command mode
-      - uart.write:
-          id: radar_uart
-          data: [0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xFE,0x00, 0x04,0x03,0x02,0x01]
-      - delay: 300ms
-      # Open command mode again for disappearance delay
-      - uart.write:
-          id: radar_uart
-          data: [0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01]
-      - delay: 300ms
-      # SetConfig DisappearanceDelay — read seconds from slider
+      - delay: 100ms
       - lambda: |-
           uint16_t d = (uint16_t)id(radar_disappearance_delay).state;
-          uint8_t cmd[] = {0xFD,0xFC,0xFB,0xFA, 0x08,0x00, 0x07,0x00, 0x04,0x00,
-                           (uint8_t)(d & 0xFF),(uint8_t)(d >> 8),0x00,0x00,
+          uint8_t cmd[] = {0xFD,0xFC,0xFB,0xFA, 0x08,0x00, 0x07,0x00,
+                           0x04,0x00, (uint8_t)(d & 0xFF), (uint8_t)(d >> 8), 0x00,0x00,
                            0x04,0x03,0x02,0x01};
           id(radar_uart).write_array(cmd, sizeof(cmd));
-      - delay: 300ms
-      # Close command mode
+      - delay: 100ms
       - uart.write:
           id: radar_uart
           data: [0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xFE,0x00, 0x04,0x03,0x02,0x01]
-      - delay: 300ms
-      # Re-enable Report mode so OT2 and UART data frames resume
+      - delay: 100ms
       - uart.write:
           id: radar_uart
           data: [0xFD,0xFC,0xFB,0xFA, 0x08,0x00, 0x12,0x00, 0x00,0x00, 0x04,0x00,0x00,0x00, 0x04,0x03,0x02,0x01]
+      - delay: 200ms
       - logger.log:
           level: INFO
-          format: "Radar configured"
+          format: "Radar: config applied (max_gate, disappearance_delay) + Report Mode"
+
+  # AutoThresholdGen (cmd 0x09). Frame payload is a guess from LD2410: three
+  # u16 LE coefficients (motion-trigger, motion-hold, scan-seconds). Room MUST
+  # be empty during the scan window; the radar will tune its noise floor.
+  - id: auto_calibrate_radar
+    mode: single
+    then:
+      - logger.log:
+          level: WARN
+          format: "Radar: auto-calibration starting — LEAVE THE ROOM FOR 15s"
+      - uart.write:
+          id: radar_uart
+          data: [0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01]
+      - delay: 100ms
+      - uart.write:
+          id: radar_uart
+          data: [0xFD,0xFC,0xFB,0xFA, 0x08,0x00, 0x09,0x00, 0x0A,0x00, 0x0A,0x00, 0x0A,0x00, 0x04,0x03,0x02,0x01]
+      - delay: 12000ms
+      - uart.write:
+          id: radar_uart
+          data: [0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xFE,0x00, 0x04,0x03,0x02,0x01]
+      - delay: 100ms
+      - uart.write:
+          id: radar_uart
+          data: [0xFD,0xFC,0xFB,0xFA, 0x08,0x00, 0x12,0x00, 0x00,0x00, 0x04,0x00,0x00,0x00, 0x04,0x03,0x02,0x01]
+      - delay: 200ms
+      - logger.log:
+          level: WARN
+          format: "Radar: auto-calibration done — safe to return"
 
   # evaluate_buzzer: called on every state change (presence, debug toggle,
   # window open/close). Decides whether the buzzer should be on or off.
@@ -419,10 +489,9 @@ script:
               // day_of_week: 0=Sun, 1=Mon, …, 5=Fri, 6=Sat (ESPTime convention)
               if (t.day_of_week < 1 || t.day_of_week > 5) return false;
 
-              // Read select entities (strings) and convert to int for comparison.
               int now_m   = t.hour * 60 + t.minute;
-              int start_m = std::stoi(id(window_start_hour).state)  * 60 + std::stoi(id(window_start_minute).state);
-              int end_m   = std::stoi(id(window_end_hour).state)    * 60 + std::stoi(id(window_end_minute).state);
+              int start_m = id(window_start).hour * 60 + id(window_start).minute;
+              int end_m   = id(window_end).hour   * 60 + id(window_end).minute;
               return now_m >= start_m && now_m < end_m;
           then:
             - script.execute: alarm_on
@@ -487,8 +556,8 @@ sensor:
     name: "Wi-Fi Signal"
     update_interval: 60s
 
-  # Published by the UART interval parser above. 0 = no target; >0 = distance in cm.
-  # The web server graphs this automatically, giving a detection-over-time view.
+  # Distance to detected target. In ASCII mode this is gate × 70cm; in binary
+  # Report Mode it is the radar's reported cm value. Pushed by the UART parser.
   - platform: template
     name: "Radar Distance"
     id: radar_distance
@@ -496,12 +565,26 @@ sensor:
     device_class: distance
     state_class: measurement
     accuracy_decimals: 0
-    update_interval: never   # pushed by the UART parser on every data frame
+    update_interval: never
+
+  # Peak signal energy across gates 0..radar_max_gate. Only populated in binary
+  # Report Mode (requires RX wire connected); stays NA in ASCII mode.
+  - platform: template
+    name: "Peak Gate Energy"
+    id: radar_peak_energy
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
 
 # -----------------------------------------------------------------------
-# STATUS SENSOR — visible in ESPHome dashboard and logs
+# TEXT SENSORS — radar target state and overall alarm state
 # -----------------------------------------------------------------------
 text_sensor:
+  - platform: template
+    name: "Target Type"
+    id: radar_target_type
+    update_interval: never   # pushed by UART parser; "present" or "absent"
+
   - platform: template
     name: "Alarm Status"
     update_interval: 30s
@@ -510,8 +593,8 @@ text_sensor:
       auto t = id(sntp_time).now();
       if (!t.is_valid())                 return {"no time sync"};
       int m = t.hour * 60 + t.minute;
-      int s = std::stoi(id(window_start_hour).state) * 60 + std::stoi(id(window_start_minute).state);
-      int e = std::stoi(id(window_end_hour).state)   * 60 + std::stoi(id(window_end_minute).state);
+      int s = id(window_start).hour * 60 + id(window_start).minute;
+      int e = id(window_end).hour   * 60 + id(window_end).minute;
       bool wd = (t.day_of_week >= 1 && t.day_of_week <= 5);
       if (wd && m >= s && m < e)         return {"WINDOW ACTIVE"};
       return {"idle"};

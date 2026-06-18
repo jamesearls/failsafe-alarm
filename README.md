@@ -25,14 +25,16 @@ A "get out of bed" alarm that runs entirely on a small Wi-Fi microcontroller. A 
 |------|-------------|---------|
 | Radar `3V3` | `+3V3` EXT2 pin 1 | Radar power — 3.3V only |
 | Radar `GND` | `GND` EXT2 pin 2 | Ground |
-| Radar `OT2` | `IO5` EXT1 pin 8 | Presence signal (HIGH = detected) |
-| Radar `TX` | `IO6` EXT1 pin 9 | Radar → ESP (UART config) |
-| Radar `RX` | `IO3` EXT1 pin 6 | ESP → Radar (UART config) |
+| Radar `OT2` | `IO5` EXT1 pin 8 | Presence signal — **drives the alarm** |
+| Radar `TX` | `IO7` EXT1 pin 10 | Monitoring stream (ASCII presence + distance) |
+| Radar `RX` | `IO3` EXT1 pin 6 | **Optional** — only needed for binary Report Mode with energy data |
 | Buzzer red (VCC) | `+5V` EXT1 pin 1 | Buzzer power |
 | Buzzer black (GND) | `GND` EXT1 pin 2 | Ground |
 | Buzzer yellow (Signal) | `IO4` EXT1 pin 7 | PWM tone output |
 
 **Buzzer lead colours:** Red = VCC, Black = GND, Yellow = Signal. Verify against the silkscreen on the DFR0032 board before powering.
+
+**OT2 is the safety guarantee.** The alarm uses the OT2 hardware pin, not UART, so monitoring data being absent doesn't affect the alarm itself.
 
 ## Setup
 
@@ -63,39 +65,48 @@ Open **http://failsafe-alarm.local** in a browser on the same network. You'll fi
 
 | Control | What it does |
 |---------|-------------|
-| **Debug Mode** switch | Makes the buzzer pip whenever presence is detected, ignoring the time window. Use this to calibrate the radar while mounted. Volume is reduced in this mode so you're not deafened. |
+| **Debug Mode** switch | Makes the buzzer pip whenever presence is detected, ignoring the time window. Use this to calibrate the radar while mounted. Volume is reduced so you're not deafened. |
 | **Test Buzzer** button | Sounds the full alarm for 3 seconds at the current volume setting. |
-| **Apply Radar Config** button | Sends range and delay settings to the radar over UART. Press after changing the gate or delay sliders. |
+| **Apply Radar Config** button | Pushes Radar Max Gate + Radar Disappearance Delay to the radar over UART, and re-asserts Report Mode. Requires Radar RX wired to IO3. |
+| **Auto-Calibrate Radar** button | Triggers the radar's self-calibration (cmd `0x09`). Leave the room first — the radar samples background noise for ~10s and tunes its noise floor. Speculative for HMMD; effect not verified. |
 | **Alarm Volume** slider | Loudness of the real alarm (0–100%). |
-| **Window Start Hour / Minute** | When the alarm window opens each weekday. |
-| **Window End Hour / Minute** | When the alarm window closes each weekday. |
-| **Radar Max Gate** slider | Detection range. Each gate ≈ 0.70m. Set this so the radar just reaches the bed surface but not the rest of the room. Start at 2 (≈1.4m) and increase if it doesn't detect you lying down. |
-| **Radar Disappearance Delay** slider | How many seconds after you leave before the radar reports absence. 1s = fastest shutoff. Increase if the alarm cuts out while you're still in bed. |
-| **Radar Presence** indicator | Live detection state — ON/OFF. |
-| **Radar Distance** sensor | Distance to detected target in cm (0 = nobody there). |
+| **Window Start** time | When the alarm window opens each weekday (HH:MM picker). |
+| **Window End** time | When the alarm window closes each weekday (HH:MM picker). |
+| **Radar Max Gate** slider | Limits the OT2 hardware detection range. Each gate ≈ 0.70m. Requires Radar RX wired + **Apply Radar Config** pressed. |
+| **Radar Disappearance Delay** slider | Seconds of no-detection before the radar reports absence. Higher = more reliable stillness detection, slower alarm cutoff. Requires Radar RX wired + **Apply Radar Config** pressed. |
+| **Radar Presence** indicator | OT2 hardware pin: ON/OFF. This is what triggers the alarm. |
+| **Radar Distance** sensor | Distance to detected target in cm. In ASCII mode this is gate × 70cm; in binary Report Mode it's the radar's actual cm reading. |
+| **Target Type** text | `present` / `absent` as reported over UART. |
+| **Peak Gate Energy** sensor | Strongest gate signal across gates 0..Max Gate. Only updates in binary Report Mode (Radar RX wire required). |
 | **Alarm Status** text | `idle` / `WINDOW ACTIVE` / `DEBUG (calibration)` / `no time sync`. |
 | **Uptime** | Seconds since last boot. Resets to 0 on power loss. |
 | **Wi-Fi Signal** | Signal strength in dBm. |
 
+## Monitoring modes
+
+The radar starts in **ASCII Normal Mode** and outputs lines like `ON\r\nRange 4\r\n` continuously. The firmware parses this for the **Radar Distance** and **Target Type** sensors. This works with only the Radar TX wire connected to IO7.
+
+To get per-gate energy data, connect Radar RX to IO3 and press **Apply Radar Config**. The radar will switch to binary frames and **Peak Gate Energy** will start updating. The parser auto-detects whichever format is arriving.
+
 ## Calibrating the radar
 
-The radar needs to see the bed but not the whole room. The default range (gate 2, ≈1.4m) assumes the sensor is mounted roughly 1–1.5m above the mattress.
+The radar's detection range is limited via the **Radar Max Gate** slider (requires Radar RX wired). Each gate ≈ 0.70m, so gate 2 ≈ 1.4m, gate 3 ≈ 2.1m. Without RX wired, the radar operates at its full default range (~8.5m).
 
-1. Mount the radar pointing straight down at your sleeping position.
+1. Mount the radar — ideally pointing straight down at your sleeping position from 1–1.5m above. Side-table mounting works for the alarm logic but breathing detection while motionless is harder from that angle (chest movement is perpendicular to the beam).
 2. Turn on **Debug Mode** in the web UI.
 3. Lie in your normal sleeping position — you should hear quiet pip beeps and see **Radar Presence = ON**.
-4. Get up and walk out — beeps should stop within 1–2 seconds.
-5. If it doesn't detect you lying down, increase **Radar Max Gate** by 1 and press **Apply Radar Config**.
-6. If it detects you from across the room, decrease **Radar Max Gate** and press **Apply**.
+4. Get up and walk out — beeps should stop after the **Radar Disappearance Delay** elapses (default 5s).
+5. If it triggers from across the room: reduce **Radar Max Gate** and press **Apply Radar Config**.
+6. If it cuts out while you're still in bed: increase **Radar Disappearance Delay** (try 20s) and press **Apply Radar Config**.
 7. Turn **Debug Mode** off when done.
 
 ## Testing the alarm without waiting for 08:30
 
-Use the **Window Start / End** dropdowns to set the window to 2 minutes from now. Lie in bed — the full alarm should fire when the window opens. Get up to silence it. Then restore the real times.
+Use the **Window Start** / **Window End** time pickers to set the window to 2 minutes from now. Lie in bed — the full alarm should fire when the window opens. Get up to silence it. Then restore the real times.
 
 ## Changing the alarm time
 
-Use the **Window Start Hour**, **Window Start Minute**, **Window End Hour**, **Window End Minute** dropdowns in the web UI. Changes take effect within one minute — no reflash needed.
+Use the **Window Start** and **Window End** time pickers in the web UI. Changes take effect within one minute — no reflash needed.
 
 ## Timezone and DST
 
@@ -116,8 +127,10 @@ api_key: "32-byte base64 key for the ESPHome API"
 ## If something goes wrong
 
 - **Buzzer sounds constantly at boot:** Debug Mode may have been left on. Open the web UI and turn it off.
-- **Alarm fires on weekends:** Check the window — if the window is open you may have the dropdowns set to non-weekday behaviour. The firmware enforces Mon–Fri internally.
+- **Alarm fires on weekends:** The firmware enforces Mon–Fri internally. If you see this, check `Alarm Status` and the day-of-week of the device clock.
 - **Device not reachable:** If Wi-Fi is down, the device brings up a fallback access point called `failsafe-fallback`. Connect to it and open http://192.168.4.1 to reconfigure Wi-Fi.
-- **Radar detects all the time:** Radar Max Gate is probably too high. Reduce it and press Apply Radar Config.
-- **Alarm doesn't fire when in bed:** Radar Max Gate might be too low. Increase it and press Apply.
+- **Radar detects continuously across the whole room:** Reduce **Radar Max Gate** to 2 or 3 and press **Apply Radar Config** (requires Radar RX wired to IO3). Without RX, the only option is to physically tighten the radar's beam coverage.
+- **Doesn't reliably detect stillness:** Increase **Radar Disappearance Delay** (try 15–30s) and press **Apply Radar Config**. The radar's micro-motion sensitivity itself isn't user-configurable on this chip — undocumented commands are silently ignored.
+- **Radar Distance / Target Type stay NA:** The Radar TX wire isn't reaching IO7, or the radar's UART output is silent. Reseat the wire and power-cycle the whole device (unplug USB-C completely for 5+ seconds).
+- **Peak Gate Energy is NA:** Expected unless Radar RX is wired to IO3 and the radar is in Report Mode (press **Send Report Mode Command**).
 - **Time shows 1970 in logs:** Normal on first boot before SNTP syncs. Give it 10 seconds after Wi-Fi connects.
