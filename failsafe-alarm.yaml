@@ -219,7 +219,7 @@ number:
 # -----------------------------------------------------------------------
 datetime:
   - platform: template
-    name: "Window Start"
+    name: "Window Begin"
     id: window_start
     type: time
     icon: "mdi:clock-start"
@@ -416,6 +416,12 @@ script:
   - id: configure_radar
     mode: single
     then:
+      # Defensive CloseCommandMode in case the radar is stuck in command mode
+      # from a previous interrupted run (e.g. after OTA without a power cycle).
+      - uart.write:
+          id: radar_uart
+          data: [0xFD,0xFC,0xFB,0xFA, 0x02,0x00, 0xFE,0x00, 0x04,0x03,0x02,0x01]
+      - delay: 150ms
       - uart.write:
           id: radar_uart
           data: [0xFD,0xFC,0xFB,0xFA, 0x04,0x00, 0xFF,0x00, 0x01,0x00, 0x04,0x03,0x02,0x01]
@@ -492,13 +498,21 @@ script:
               auto t = id(sntp_time).now();
               if (!t.is_valid()) return false;
 
-              // day_of_week: 0=Sun, 1=Mon, …, 5=Fri, 6=Sat (ESPTime convention)
-              if (t.day_of_week < 1 || t.day_of_week > 5) return false;
+              // ESPTime convention: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat
+              if (t.day_of_week < 2 || t.day_of_week > 6) return false;
 
               int now_m   = t.hour * 60 + t.minute;
               int start_m = id(window_start).hour * 60 + id(window_start).minute;
               int end_m   = id(window_end).hour   * 60 + id(window_end).minute;
-              return now_m >= start_m && now_m < end_m;
+              bool in_win = now_m >= start_m && now_m < end_m;
+              ESP_LOGW("eval", "presence=%d dow=%d now=%02d:%02d start=%02d:%02d end=%02d:%02d in_window=%d",
+                (int)id(radar_presence).state,
+                (int)t.day_of_week,
+                (int)t.hour, (int)t.minute,
+                (int)id(window_start).hour, (int)id(window_start).minute,
+                (int)id(window_end).hour,   (int)id(window_end).minute,
+                (int)in_win);
+              return in_win;
           then:
             - script.execute: alarm_on
           else:
@@ -601,6 +615,6 @@ text_sensor:
       int m = t.hour * 60 + t.minute;
       int s = id(window_start).hour * 60 + id(window_start).minute;
       int e = id(window_end).hour   * 60 + id(window_end).minute;
-      bool wd = (t.day_of_week >= 1 && t.day_of_week <= 5);
+      bool wd = (t.day_of_week >= 2 && t.day_of_week <= 6);   // Mon-Fri in ESPTime (1=Sun)
       if (wd && m >= s && m < e)         return {"WINDOW ACTIVE"};
       return {"idle"};
